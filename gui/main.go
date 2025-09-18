@@ -254,11 +254,16 @@ func MakeRunForm(w fyne.Window, outputCh chan string, resultCh chan *worker.Resu
 	statusCode.SetText("403")
 	statusCode.Validator = validation.NewRegexp(`^\d+$`, "StatusCode必须是数字")
 
+	// proxy address
+	proxyAddr := widget.NewEntry()
+	proxyAddr.SetPlaceHolder("socks5://127.0.0.1:7890")
+
 	advanceForm := &widget.Form{
 		Items: []*widget.FormItem{
 			{Text: "修改请求(Host)", Widget: reqHost, HintText: ""},
 			{Text: "请求超时", Widget: timeout, HintText: ""},
 			{Text: "拦截状态码(respCode)", Widget: statusCode, HintText: "一般情况下WAF拦截状态码为403"},
+			{Text: "代理地址", Widget: proxyAddr, HintText: "例如: socks5://127.0.0.1:7890"},
 		},
 	}
 
@@ -307,7 +312,8 @@ func MakeRunForm(w fyne.Window, outputCh chan string, resultCh chan *worker.Resu
 			statusCode := strings.TrimSpace(statusCode.Text)
 			statusCodeI, _ := strconv.Atoi(statusCode)
 
-			err := run(target.Text, reqHost.Text, worksNum, statusCodeI, resultCh, stopCh)
+			proxy := strings.TrimSpace(proxyAddr.Text)
+			err := run(target.Text, reqHost.Text, worksNum, statusCodeI, proxy, resultCh, stopCh)
 			if err != nil {
 				outputCh <- err.Error()
 			}
@@ -460,7 +466,14 @@ func MakeTestCaseTab(w fyne.Window) fyne.CanvasObject {
 	return container.NewBorder(tableFilterForm, nil, nil, exportBtn, table)
 }
 
-func run(target, mHost string, c, statusCode int, resultCh chan *worker.Result, stopCh chan struct{}) error {
+func run(target, mHost string, c, statusCode int, proxy string, resultCh chan *worker.Result, stopCh chan struct{}) error {
+	if proxy != "" {
+		_, err := url.Parse(proxy)
+		if err != nil {
+			return fmt.Errorf("代理地址无效: %s", err)
+		}
+	}
+
 	var addr string
 	var isHttps bool
 
@@ -492,6 +505,7 @@ func run(target, mHost string, c, statusCode int, resultCh chan *worker.Result, 
 		worker.WithReqHost(mHost),
 		worker.WithUseEmbedFS(true), // use embed test case fs when glob is empty
 		worker.WithResultCh(resultCh),
+		worker.WithProxy(proxy),
 	)
 	go func() {
 		<-stopCh
