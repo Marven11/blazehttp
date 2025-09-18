@@ -11,8 +11,6 @@ import (
 	"sync"
 	"time"
 
-	blazehttp "github.com/chaitin/blazehttp/http"
-
 	"github.com/chaitin/blazehttp/testcases"
 )
 
@@ -40,6 +38,7 @@ type Worker struct {
 	reqPerSession   bool   // request per session
 	useEmbedFS      bool
 	resultCh        chan *Result
+	client          *http.Client
 }
 
 type WorkerOption func(*Worker)
@@ -122,6 +121,15 @@ func NewWorker(
 	for _, opt := range options {
 		opt(w)
 	}
+
+	// Initialize HTTP client with timeout and proxy support
+	w.client = &http.Client{
+		Timeout: time.Duration(w.timeout) * time.Millisecond,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+		},
+	}
+
 	return w
 }
 
@@ -251,42 +259,22 @@ func (w *Worker) runWorker() {
 				job.Result.Err = fmt.Sprintf("%s\n", err)
 				return
 			}
-			// 序列化请求
-			var buf bytes.Buffer
-			err = httpReq.Write(&buf)
-			if err != nil {
-				job.Result.Err = fmt.Sprintf("serialize request error: %s\n", err)
-				return
-			}
-			requestBytes := buf.Bytes()
-
 			start := time.Now()
-			conn := blazehttp.Connect(w.addr, w.isHttps, w.timeout)
-			if conn == nil {
-				job.Result.Err = fmt.Sprintf("connect to %s failed!\n", w.addr)
-				return
-			}
-			nWrite, err := (*conn).Write(requestBytes)
+			httpResp, err := w.client.Do(httpReq)
 			if err != nil {
-				job.Result.Err = fmt.Sprintf("send request poc: %s length: %d error: %s", filePath, nWrite, err)
+				job.Result.Err = fmt.Sprintf("send request error: %s", err)
 				return
 			}
-
-			rsp := new(blazehttp.Response)
-			if err = rsp.ReadConn(*conn); err != nil {
-				job.Result.Err = fmt.Sprintf("read poc file: %s response, error: %s", filePath, err)
-				return
-			}
+			defer httpResp.Body.Close() // Close the body to avoid leaks
 			elap := time.Since(start).Nanoseconds()
-			(*conn).Close()
+
 			job.Result.Success = true
 			if strings.HasSuffix(job.FilePath, "white") {
 				job.Result.IsWhite = true // white case
 			}
 
-			code := rsp.GetStatusCode()
-			job.Result.StatusCode = code
-			if code != w.blockStatusCode {
+			job.Result.StatusCode = httpResp.StatusCode
+			if httpResp.StatusCode != w.blockStatusCode {
 				job.Result.IsPass = true
 			}
 			job.Result.TimeCost = elap
