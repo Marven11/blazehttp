@@ -1,8 +1,12 @@
 package worker
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -179,6 +183,62 @@ func (w *Worker) Run() {
 	fmt.Println(w.generateResult())
 }
 
+func (w *Worker) readRequestFromFile(filePath string) (*http.Request, error) {
+	// 读取文件内容
+	var data []byte
+	var err error
+	if w.useEmbedFS {
+		data, err = testcases.EmbedTestCasesFS.ReadFile(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("read request file: %s from embed fs error: %s", filePath, err)
+		}
+	} else {
+		data, err = os.ReadFile(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("read request file: %s error: %s", filePath, err)
+		}
+	}
+
+	// 解析HTTP请求
+	reader := bufio.NewReader(bytes.NewReader(data))
+	httpReq, err := http.ReadRequest(reader)
+	if err != nil {
+		return nil, fmt.Errorf("parse request file: %s error: %s", filePath, err)
+	}
+
+	// 设置URL的Scheme和Host
+	if httpReq.URL.Scheme == "" {
+		if w.isHttps {
+			httpReq.URL.Scheme = "https"
+		} else {
+			httpReq.URL.Scheme = "http"
+		}
+	}
+	if httpReq.URL.Host == "" {
+		if w.reqHost != "" {
+			httpReq.URL.Host = w.reqHost
+		} else {
+			httpReq.URL.Host = w.addr
+		}
+	}
+
+	// 清除RequestURI，因为客户端请求中不允许设置
+	httpReq.RequestURI = ""
+
+	// 设置Host头
+	if w.reqHost != "" {
+		httpReq.Host = w.reqHost
+	} else {
+		httpReq.Host = w.addr
+	}
+
+	// 设置Connection头
+	if w.reqPerSession {
+		httpReq.Header.Set("Connection", "close")
+	}
+	return httpReq, nil
+}
+
 func (w *Worker) runWorker() {
 	for job := range w.jobs {
 		func() {
@@ -186,31 +246,19 @@ func (w *Worker) runWorker() {
 				w.jobResult <- job
 			}()
 			filePath := job.FilePath
-			req := new(blazehttp.Request)
-			if w.useEmbedFS {
-				if err := req.ReadFileFromFS(testcases.EmbedTestCasesFS, filePath); err != nil {
-					job.Result.Err = fmt.Sprintf("read request file: %s from embed fs error: %s\n", filePath, err)
-					return
-				}
-			} else {
-				if err := req.ReadFile(filePath); err != nil {
-					job.Result.Err = fmt.Sprintf("read request file: %s error: %s\n", filePath, err)
-					return
-				}
+			httpReq, err := w.readRequestFromFile(filePath)
+			if err != nil {
+				job.Result.Err = fmt.Sprintf("%s\n", err)
+				return
 			}
-
-			if w.reqHost != "" {
-				req.SetHost(w.reqHost)
-			} else {
-				req.SetHost(w.addr)
+			// 序列化请求
+			var buf bytes.Buffer
+			err = httpReq.Write(&buf)
+			if err != nil {
+				job.Result.Err = fmt.Sprintf("serialize request error: %s\n", err)
+				return
 			}
-
-			if w.reqPerSession {
-				// one http request one connection
-				req.SetHeader("Connection", "close")
-			}
-
-			req.CalculateContentLength()
+			requestBytes := buf.Bytes()
 
 			start := time.Now()
 			conn := blazehttp.Connect(w.addr, w.isHttps, w.timeout)
@@ -218,7 +266,7 @@ func (w *Worker) runWorker() {
 				job.Result.Err = fmt.Sprintf("connect to %s failed!\n", w.addr)
 				return
 			}
-			nWrite, err := req.WriteTo(*conn)
+			nWrite, err := (*conn).Write(requestBytes)
 			if err != nil {
 				job.Result.Err = fmt.Sprintf("send request poc: %s length: %d error: %s", filePath, nWrite, err)
 				return
