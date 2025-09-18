@@ -28,6 +28,7 @@ var (
 	c                 = 10   // default 10 concurrent workers
 	mHost             string // modify host header
 	requestPerSession bool   // send request per session
+	proxyAddr         string // proxy address, example: socks5://127.0.0.1:7890
 )
 
 func init() {
@@ -41,14 +42,23 @@ func init() {
 	flag.IntVar(&timeout, "timeout", 1000, "connection timeout, default 1000 ms")
 	flag.StringVar(&mHost, "H", "", "modify host header")
 	flag.BoolVar(&requestPerSession, "rps", true, "send request per session")
+	flag.StringVar(&proxyAddr, "proxy", "", "proxy address, example: socks5://127.0.0.1:7890")
 	flag.Parse()
 	if url, err := url.Parse(target); err != nil || url.Scheme == "" || url.Host == "" {
 		fmt.Println("invalid target url, example: http://chaitin.com:9443")
 		os.Exit(1)
 	}
+	if proxyAddr != "" {
+		_, err := url.Parse(proxyAddr)
+		if err != nil {
+			fmt.Printf("invalid proxy address: %s\n", proxyAddr)
+			os.Exit(1)
+		}
+	}
 }
 
 func main() {
+
 	var addr string
 	var isHttps bool
 
@@ -123,6 +133,7 @@ func main() {
 		worker.WithTimeout(timeout),
 		worker.WithUseEmbedFS(glob == ""), // use embed test case fs when glob is empty
 		worker.WithProgressBar(progressBar),
+		worker.WithProxy(proxyAddr),
 	)
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)

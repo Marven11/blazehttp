@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -37,6 +38,7 @@ type Worker struct {
 	reqHost         string // request host of header
 	reqPerSession   bool   // request per session
 	useEmbedFS      bool
+	proxy           string // proxy address
 	resultCh        chan *Result
 	client          *http.Client
 }
@@ -85,6 +87,12 @@ func WithProgressBar(pb Progress) WorkerOption {
 	}
 }
 
+func WithProxy(proxyAddr string) WorkerOption {
+	return func(w *Worker) {
+		w.proxy = proxyAddr
+	}
+}
+
 func (w *Worker) Stop() {
 	w.cancel()
 }
@@ -122,12 +130,20 @@ func NewWorker(
 		opt(w)
 	}
 
-	// Initialize HTTP client with timeout and proxy support
+	transport := &http.Transport{
+		Proxy: nil,
+	}
+	if w.proxy != "" {
+		proxyUrl, err := url.Parse(w.proxy)
+		if err != nil {
+			fmt.Printf("invalid proxy address: %s\n", w.proxy)
+			os.Exit(1)
+		}
+		transport.Proxy = http.ProxyURL(proxyUrl)
+	}
 	w.client = &http.Client{
-		Timeout: time.Duration(w.timeout) * time.Millisecond,
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-		},
+		Timeout:   time.Duration(w.timeout) * time.Millisecond,
+		Transport: transport,
 	}
 
 	return w
