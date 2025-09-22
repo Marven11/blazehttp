@@ -4,15 +4,20 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/chaitin/blazehttp/testcases"
+
+	"golang.org/x/net/proxy"
 )
 
 type Progress interface {
@@ -40,7 +45,6 @@ type Worker struct {
 	useEmbedFS      bool
 	proxy           string // proxy address
 	resultCh        chan *Result
-	client          *http.Client
 }
 
 type WorkerOption func(*Worker)
@@ -130,22 +134,6 @@ func NewWorker(
 		opt(w)
 	}
 
-	transport := &http.Transport{
-		Proxy: nil,
-	}
-	if w.proxy != "" {
-		proxyUrl, err := url.Parse(w.proxy)
-		if err != nil {
-			fmt.Printf("invalid proxy address: %s\n", w.proxy)
-			os.Exit(1)
-		}
-		transport.Proxy = http.ProxyURL(proxyUrl)
-	}
-	w.client = &http.Client{
-		Timeout:   time.Duration(w.timeout) * time.Millisecond,
-		Transport: transport,
-	}
-
 	return w
 }
 
@@ -207,8 +195,12 @@ func (w *Worker) Run() {
 	fmt.Println(w.generateResult())
 }
 
-func (w *Worker) readRequestFromFile(filePath string) (*http.Request, error) {
-	// 读取文件内容
+func fixHostHeader(rawRequest []byte, hostHeader string) []byte {
+	re := regexp.MustCompile(`(?i)(Host:.*\r\n)`)
+	return re.ReplaceAll(rawRequest, []byte(fmt.Sprintf("Host: %s\r\n", hostHeader)))
+}
+
+func (w *Worker) readRequestFromFile(filePath string) ([]byte, error) {
 	var data []byte
 	var err error
 	if w.useEmbedFS {
@@ -219,48 +211,121 @@ func (w *Worker) readRequestFromFile(filePath string) (*http.Request, error) {
 	} else {
 		data, err = os.ReadFile(filePath)
 		if err != nil {
-			return nil, fmt.Errorf("read request file: %s error: %s", filePath, err)
+			return nil, fmt.Errorf("read request file: %s error: %v", filePath, err)
 		}
 	}
 
-	// 解析HTTP请求
-	reader := bufio.NewReader(bytes.NewReader(data))
-	httpReq, err := http.ReadRequest(reader)
+	return fixHostHeader(data, w.addr), nil
+}
+func rewriteRequestRfc7230(host string, rawRequest []byte) []byte {
+	scheme := []byte("http")
+
+	lines := bytes.SplitN(rawRequest, []byte("\n"), 2)
+	if len(lines) < 2 {
+		return rawRequest
+	}
+
+	parts := bytes.Fields(lines[0])
+	if len(parts) < 3 {
+		return rawRequest
+	}
+
+	newFirstLine := append([]byte(parts[0]), []byte(" ")...)
+	newFirstLine = append(newFirstLine, scheme...)
+	newFirstLine = append(newFirstLine, []byte("://")...)
+	newFirstLine = append(newFirstLine, []byte(host)...)
+	newFirstLine = append(newFirstLine, parts[1]...)
+	newFirstLine = append(newFirstLine, []byte(" ")...)
+	newFirstLine = append(newFirstLine, parts[2]...)
+	newFirstLine = append(newFirstLine, []byte("\r\n")...)
+
+	result := append(newFirstLine, lines[1]...)
+	return result
+}
+
+func (w *Worker) doConnect(rawRequest []byte) (conn net.Conn, request []byte, err error) {
+
+	request = rawRequest
+
+	// 解析目标地址
+	addr := w.addr
+	host, port, err := net.SplitHostPort(w.addr)
 	if err != nil {
-		return nil, fmt.Errorf("parse request file: %s error: %s", filePath, err)
+		return nil, nil, err
 	}
 
-	// 设置URL的Scheme和Host
-	if httpReq.URL.Scheme == "" {
+	if port == "" {
 		if w.isHttps {
-			httpReq.URL.Scheme = "https"
+			addr = host + ":443"
 		} else {
-			httpReq.URL.Scheme = "http"
-		}
-	}
-	if httpReq.URL.Host == "" {
-		if w.reqHost != "" {
-			httpReq.URL.Host = w.reqHost
-		} else {
-			httpReq.URL.Host = w.addr
+			addr = host + ":80"
 		}
 	}
 
-	// 清除RequestURI，因为客户端请求中不允许设置
-	httpReq.RequestURI = ""
+	if w.proxy == "" {
+		conn, err = net.Dial("tcp", addr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("dial error: %v", err)
+		}
+	} else if w.proxy != "" {
+		proxyUrl, err := url.Parse(w.proxy)
 
-	// 设置Host头
-	if w.reqHost != "" {
-		httpReq.Host = w.reqHost
-	} else {
-		httpReq.Host = w.addr
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if proxyUrl.Scheme == "http" {
+			conn, err = net.Dial("tcp", proxyUrl.Host)
+			if err != nil {
+				return nil, nil, fmt.Errorf("connect proxy error: %v", err)
+			}
+			if w.isHttps {
+				fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\\r\\nHost: %s\\r\\n\\r\\n", addr, addr)
+				reader := bufio.NewReader(conn)
+				line, err := reader.ReadString('\n')
+				if err != nil || !strings.HasPrefix(line, "HTTP/1.1 200") {
+					conn.Close()
+					return nil, nil, fmt.Errorf("CONNECT failed: %s", line)
+				}
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil || line == "\\r\\n" {
+						break
+					}
+				}
+			} else {
+				request = rewriteRequestRfc7230(w.addr, rawRequest)
+			}
+		} else if proxyUrl.Scheme == "socks5" {
+			dialer, err := proxy.SOCKS5("tcp", proxyUrl.Host, nil, proxy.Direct)
+			if err != nil {
+				return nil, nil, fmt.Errorf("SOCKS dialer error: %v", err)
+			}
+			conn, err = dialer.Dial("tcp", w.addr)
+			if err != nil {
+				return nil, nil, fmt.Errorf("SOCKS connect error: %v", err)
+			}
+		} else {
+			return nil, nil, fmt.Errorf("unsupported proxy type %s", proxyUrl.Scheme)
+		}
 	}
 
-	// 设置Connection头
-	if w.reqPerSession {
-		httpReq.Header.Set("Connection", "close")
+	// 处理TLS
+	if w.isHttps {
+		config := &tls.Config{ServerName: host}
+		tlsConn := tls.Client(conn, config)
+		if err := tlsConn.Handshake(); err != nil {
+			conn.Close()
+			return nil, nil, fmt.Errorf("TLS handshake error: %v", err)
+		}
+		conn = tlsConn
 	}
-	return httpReq, nil
+
+    timeout := time.Duration(w.timeout) * time.Millisecond
+    conn.SetReadDeadline(time.Now().Add(timeout))
+    conn.SetWriteDeadline(time.Now().Add(timeout))
+
+	return conn, request, nil
 }
 
 func (w *Worker) runWorker() {
@@ -270,30 +335,46 @@ func (w *Worker) runWorker() {
 				w.jobResult <- job
 			}()
 			filePath := job.FilePath
-			httpReq, err := w.readRequestFromFile(filePath)
+			rawRequest, err := w.readRequestFromFile(filePath)
 			if err != nil {
 				job.Result.Err = fmt.Sprintf("%s\n", err)
 				return
 			}
-			start := time.Now()
-			httpResp, err := w.client.Do(httpReq)
+			conn, request, err := w.doConnect(rawRequest)
 			if err != nil {
-				job.Result.Err = fmt.Sprintf("send request error: %s", err)
+				job.Result.Err = fmt.Sprintf("%s\n", err)
 				return
 			}
-			defer httpResp.Body.Close() // Close the body to avoid leaks
+			defer conn.Close()
+			start := time.Now()
+			_, err = conn.Write([]byte(request))
+			if err != nil {
+				conn.Close()
+				job.Result.Err = fmt.Sprintf("write request error: %v", err)
+				return
+			}
+
+			reader := bufio.NewReader(conn)
+			resp, err := http.ReadResponse(reader, nil)
+			if err != nil {
+				conn.Close()
+				job.Result.Err = fmt.Sprintf("read response error: %v", err)
+				return
+			}
+			defer resp.Body.Close()
 			elap := time.Since(start).Nanoseconds()
 
 			job.Result.Success = true
 			if strings.HasSuffix(job.FilePath, "white") {
-				job.Result.IsWhite = true // white case
+				job.Result.IsWhite = true
 			}
 
-			job.Result.StatusCode = httpResp.StatusCode
-			if httpResp.StatusCode != w.blockStatusCode {
+			job.Result.StatusCode = resp.StatusCode
+			if resp.StatusCode != w.blockStatusCode {
 				job.Result.IsPass = true
 			}
 			job.Result.TimeCost = elap
+			conn.Close()
 		}()
 	}
 }
