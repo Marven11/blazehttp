@@ -2,7 +2,10 @@ package worker
 
 import (
 	"context"
+	"encoding/csv"
+	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +39,9 @@ type Worker struct {
 	reqPerSession   bool   // request per session
 	useEmbedFS      bool
 	resultCh        chan *Result
+	output          string // output file path
+	outputFormat    string // output format: json, csv
+	proxy           string // proxy URL
 }
 
 type WorkerOption func(*Worker)
@@ -79,6 +85,19 @@ func WithResultCh(ch chan *Result) WorkerOption {
 func WithProgressBar(pb Progress) WorkerOption {
 	return func(w *Worker) {
 		w.progressBar = pb
+	}
+}
+
+func WithOutput(output, format string) WorkerOption {
+	return func(w *Worker) {
+		w.output = output
+		w.outputFormat = format
+	}
+}
+
+func WithProxy(proxy string) WorkerOption {
+	return func(w *Worker) {
+		w.proxy = proxy
 	}
 }
 
@@ -135,6 +154,15 @@ type JobResult struct {
 	Err        string
 }
 
+type SampleResult struct {
+	FilePath   string `json:"file_path"`
+	IsWhite    bool   `json:"is_white"`
+	IsPass     bool   `json:"is_pass"`
+	StatusCode int    `json:"status_code"`
+	TimeCost   int64  `json:"time_cost_ms"`
+	Err        string `json:"error,omitempty"`
+}
+
 type Result struct {
 	Total           int64 // total poc
 	Error           int64
@@ -153,12 +181,15 @@ type Output struct {
 }
 
 func (w *Worker) Run() {
+	sampleResults := make([]SampleResult, 0, len(w.fileList))
+	var mu sync.Mutex
+
 	go func() {
 		w.jobProducer()
 	}()
 
 	go func() {
-		w.processJobResult()
+		w.processJobResultWithCollection(&sampleResults, &mu)
 		w.jobResultDone <- struct{}{}
 	}()
 
@@ -177,6 +208,14 @@ func (w *Worker) Run() {
 	<-w.jobResultDone
 
 	fmt.Println(w.generateResult())
+
+	if w.output != "" {
+		if err := w.exportResults(sampleResults); err != nil {
+			fmt.Printf("导出结果失败: %s\n", err)
+		} else {
+			fmt.Printf("结果已导出到: %s\n", w.output)
+		}
+	}
 }
 
 func (w *Worker) runWorker() {
@@ -213,7 +252,7 @@ func (w *Worker) runWorker() {
 			req.CalculateContentLength()
 
 			start := time.Now()
-			conn := blazehttp.Connect(w.addr, w.isHttps, w.timeout)
+			conn := blazehttp.Connect(w.addr, w.isHttps, w.timeout, w.proxy)
 			if conn == nil {
 				job.Result.Err = fmt.Sprintf("connect to %s failed!\n", w.addr)
 				return
@@ -275,6 +314,47 @@ func (w *Worker) processJobResult() {
 	}
 }
 
+func (w *Worker) processJobResultWithCollection(sampleResults *[]SampleResult, mu *sync.Mutex) {
+	for job := range w.jobResult {
+		if job.Result.Success {
+			w.result.Success++
+			w.result.SuccessTimeCost += job.Result.TimeCost
+			if job.Result.IsWhite {
+				if job.Result.IsPass {
+					w.result.TN++
+				} else {
+					w.result.FP++
+				}
+			} else {
+				if job.Result.IsPass {
+					w.result.FN++
+				} else {
+					w.result.TP++
+				}
+			}
+		} else {
+			w.result.Error++
+		}
+		if w.resultCh != nil {
+			r := *w.result
+			r.Job = job
+			w.resultCh <- &r
+		}
+
+		sample := SampleResult{
+			FilePath:   job.FilePath,
+			IsWhite:    job.Result.IsWhite,
+			IsPass:     job.Result.IsPass,
+			StatusCode: job.Result.StatusCode,
+			TimeCost:   job.Result.TimeCost / 1000000,
+			Err:        job.Result.Err,
+		}
+		mu.Lock()
+		*sampleResults = append(*sampleResults, sample)
+		mu.Unlock()
+	}
+}
+
 func (w *Worker) jobProducer() {
 	defer close(w.jobs)
 	for _, f := range w.fileList {
@@ -301,4 +381,41 @@ func (w *Worker) generateResult() string {
 	sb.WriteString(fmt.Sprintf("准确率: %.2f%% (正确拦截 + 正确放行）/样本总数 \n", float64(w.result.TP+w.result.TN)*100/float64(w.result.TP+w.result.TN+w.result.FP+w.result.FN)))
 	sb.WriteString(fmt.Sprintf("平均耗时: %.2f毫秒\n", float64(w.result.SuccessTimeCost)/float64(w.result.Success)/1000000))
 	return sb.String()
+}
+
+func (w *Worker) exportResults(samples []SampleResult) error {
+	f, err := os.Create(w.output)
+	if err != nil {
+		return fmt.Errorf("创建输出文件失败: %s", err)
+	}
+	defer f.Close()
+
+	if w.outputFormat == "json" {
+		encoder := json.NewEncoder(f)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(samples)
+	}
+
+	writer := csv.NewWriter(f)
+	defer writer.Flush()
+
+	header := []string{"file_path", "is_white", "is_pass", "status_code", "time_cost_ms", "error"}
+	if err := writer.Write(header); err != nil {
+		return fmt.Errorf("写入CSV表头失败: %s", err)
+	}
+
+	for _, s := range samples {
+		record := []string{
+			s.FilePath,
+			fmt.Sprintf("%t", s.IsWhite),
+			fmt.Sprintf("%t", s.IsPass),
+			fmt.Sprintf("%d", s.StatusCode),
+			fmt.Sprintf("%d", s.TimeCost),
+			s.Err,
+		}
+		if err := writer.Write(record); err != nil {
+			return fmt.Errorf("写入CSV记录失败: %s", err)
+		}
+	}
+	return nil
 }

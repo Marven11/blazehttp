@@ -28,6 +28,11 @@ var (
 	c                 = 10   // default 10 concurrent workers
 	mHost             string // modify host header
 	requestPerSession bool   // send request per session
+	output            string // output file path
+	outputFormat      string // output format: json, csv
+	proxy             string // proxy URL, e.g., http://proxy:8080, socks5://proxy:1080
+	skipWafCheck      bool   // skip WAF detection check
+	blockStatusCode   int    // custom block status code for WAF detection
 )
 
 func init() {
@@ -41,9 +46,18 @@ func init() {
 	flag.IntVar(&timeout, "timeout", 1000, "connection timeout, default 1000 ms")
 	flag.StringVar(&mHost, "H", "", "modify host header")
 	flag.BoolVar(&requestPerSession, "rps", true, "send request per session")
+	flag.StringVar(&output, "o", "", "output file path for detailed results")
+	flag.StringVar(&outputFormat, "of", "json", "output format: json, csv (default: json)")
+	flag.StringVar(&proxy, "x", "", "proxy URL, e.g., http://proxy:8080, socks5://proxy:1080")
+	flag.BoolVar(&skipWafCheck, "skip-waf-check", false, "skip WAF detection check")
+	flag.IntVar(&blockStatusCode, "block", 0, "custom block status code for WAF detection, 0 means auto detect")
 	flag.Parse()
 	if url, err := url.Parse(target); err != nil || url.Scheme == "" || url.Host == "" {
 		fmt.Println("invalid target url, example: http://chaitin.com:9443")
+		os.Exit(1)
+	}
+	if output != "" && outputFormat != "json" && outputFormat != "csv" {
+		fmt.Println("invalid output format, must be json or csv")
 		os.Exit(1)
 	}
 }
@@ -60,14 +74,17 @@ func main() {
 		addr = u.Host
 	}
 
-	isWaf, blockStatusCode, err := utils.GetWafBlockStatusCode(target, mHost)
+	isWaf, blockStatusCodeDetected, err := utils.GetWafBlockStatusCode(target, mHost)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	if !isWaf {
+	if !skipWafCheck && !isWaf {
 		fmt.Println("目标网站未开启waf")
 		os.Exit(1)
+	}
+	if blockStatusCode == 0 {
+		blockStatusCode = blockStatusCodeDetected
 	}
 
 	fileList := make([]string, 0)
@@ -123,6 +140,8 @@ func main() {
 		worker.WithTimeout(timeout),
 		worker.WithUseEmbedFS(glob == ""), // use embed test case fs when glob is empty
 		worker.WithProgressBar(progressBar),
+		worker.WithOutput(output, outputFormat),
+		worker.WithProxy(proxy),
 	)
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
