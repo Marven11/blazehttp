@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"regexp"
+	"strconv"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -64,6 +66,8 @@ func dialWithProxy(addr, proxyURL string, timeout int) (net.Conn, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Millisecond)
 		defer cancel()
 		return dialer.(proxy.ContextDialer).DialContext(ctx, "tcp", addr)
+	case "socks5h":
+		return dialSocks5WithRemoteDNS(u.Host, addr, timeout)
 	case "http", "https":
 		conn, err := net.DialTimeout("tcp", u.Host, time.Duration(timeout)*time.Millisecond)
 		if err != nil {
@@ -89,4 +93,62 @@ func dialWithProxy(addr, proxyURL string, timeout int) (net.Conn, error) {
 	default:
 		return nil, fmt.Errorf("不支持的代理协议: %s", u.Scheme)
 	}
+}
+
+func dialSocks5WithRemoteDNS(proxyHost, targetAddr string, timeout int) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", proxyHost, time.Duration(timeout)*time.Millisecond)
+	if err != nil {
+		return nil, fmt.Errorf("连接SOCKS5代理失败: %s", err)
+	}
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	host, portStr, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
+	req = append(req, []byte(host)...)
+	req = append(req, byte(port>>8), byte(port&0xff))
+	if _, err := conn.Write(req); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	resp2 := make([]byte, 4)
+	if _, err := io.ReadFull(conn, resp2); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if resp2[1] != 0x00 {
+		conn.Close()
+		return nil, fmt.Errorf("SOCKS5连接失败, 错误码: %d", resp2[1])
+	}
+	switch resp2[3] {
+	case 0x01:
+		buf := make([]byte, 4)
+		io.ReadFull(conn, buf)
+	case 0x03:
+		lenBuf := make([]byte, 1)
+		io.ReadFull(conn, lenBuf)
+		buf := make([]byte, lenBuf[0])
+		io.ReadFull(conn, buf)
+	case 0x04:
+		buf := make([]byte, 16)
+		io.ReadFull(conn, buf)
+	}
+	portBuf := make([]byte, 2)
+	io.ReadFull(conn, portBuf)
+	return conn, nil
 }
