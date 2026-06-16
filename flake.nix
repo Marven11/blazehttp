@@ -3,7 +3,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
-  outputs = { nixpkgs, ... }:
+  outputs = { self, nixpkgs, ... }:
     let
       systems = [
         "aarch64-darwin"
@@ -21,7 +21,7 @@
         {
           default = pkgs.buildGoModule {
             pname = "blazehttp";
-            version = "0.3.1-dev";
+            version = "0.3.1-dev-${self.shortRev or self.dirtyShortRev or "dirty"}";
             src = ./.;
             vendorHash = "sha256-HlAz+KNTdbyQ0n7ych1OpqTCxgeqTkJU9/MMYeGD0/Y=";
             subPackages = [ "cmd/blazehttp" ];
