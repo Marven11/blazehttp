@@ -21,7 +21,7 @@
         {
           default = pkgs.buildGoModule {
             pname = "blazehttp";
-            version = "0.3.1";
+            version = "0.3.1-dev";
             src = ./.;
             vendorHash = "sha256-HlAz+KNTdbyQ0n7ych1OpqTCxgeqTkJU9/MMYeGD0/Y=";
             subPackages = [ "cmd/blazehttp" ];
